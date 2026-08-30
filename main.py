@@ -25,6 +25,11 @@ IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 app = FastAPI(title="X4G", docs_url=None, redoc_url=None)
 
+# ── Smart Rules Engine ─────────────────────────────────────────────────────────
+from smart_rules import SmartRulesEngine, RuleType, RuleAction
+
+RULES_ENGINE: SmartRulesEngine | None = None
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_FILE = DATA_DIR / "x4g_state.json"
@@ -192,12 +197,17 @@ async def require_auth(request: Request):
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    global http_client
+    global http_client, RULES_ENGINE
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
     timeout = httpx.Timeout(30.0, connect=10.0)
     http_client = httpx.AsyncClient(
         limits=limits, timeout=timeout, follow_redirects=True,
     )
+    
+    # راه‌اندازی موتور قوانین هوشمند
+    RULES_ENGINE = SmartRulesEngine(DATA_DIR)
+    await RULES_ENGINE.initialize()
+    
     await load_state()
     await _tg_start_bot()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
@@ -1130,6 +1140,150 @@ async def dashboard(request: Request):
 @app.get("/test-ws", response_class=HTMLResponse)
 async def test_ws_redirect():
     return HTMLResponse(content="<script>location.href='/dashboard'</script>")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Smart Rules API - موتور قوانین هوشمند
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/rules/stats")
+async def get_rules_stats(_=Depends(require_auth)):
+    """دریافت آمار قوانین هوشمند"""
+    if not RULES_ENGINE:
+        raise HTTPException(status_code=503, detail="Rules engine not initialized")
+    
+    stats = await RULES_ENGINE.get_statistics()
+    return stats
+
+@app.get("/api/rules")
+async def list_rules(_=Depends(require_auth)):
+    """دریافت لیست تمام قوانین"""
+    if not RULES_ENGINE:
+        raise HTTPException(status_code=503, detail="Rules engine not initialized")
+    
+    rules = await RULES_ENGINE.get_rules()
+    return {"rules": rules}
+
+@app.post("/api/rules")
+async def create_rule(request: Request, _=Depends(require_auth)):
+    """ایجاد یک قانون جدید"""
+    if not RULES_ENGINE:
+        raise HTTPException(status_code=503, detail="Rules engine not initialized")
+    
+    body = await request.json()
+    
+    rule_type = body.get("rule_type")
+    pattern = body.get("pattern")
+    action = body.get("action")
+    country = body.get("country")
+    description = body.get("description", "")
+    
+    if not all([rule_type, pattern, action]):
+        raise HTTPException(status_code=400, detail="Missing required fields: rule_type, pattern, action")
+    
+    valid_types = [RuleType.DOMAIN, RuleType.DOMAIN_SUFFIX, RuleType.DOMAIN_KEYWORD, 
+                   RuleType.IP_CIDR, RuleType.GEOIP, RuleType.FINAL]
+    if rule_type not in valid_types:
+        raise HTTPException(status_code=400, detail=f"Invalid rule_type. Must be one of: {valid_types}")
+    
+    valid_actions = [RuleAction.PROXY, RuleAction.DIRECT, RuleAction.REJECT]
+    if action not in valid_actions:
+        raise HTTPException(status_code=400, detail=f"Invalid action. Must be one of: {valid_actions}")
+    
+    rule_id = await RULES_ENGINE.add_rule(
+        rule_type=rule_type,
+        pattern=pattern,
+        action=action,
+        country=country,
+        description=description,
+    )
+    
+    return {"ok": True, "rule_id": rule_id}
+
+@app.patch("/api/rules/{rule_id}")
+async def update_rule(rule_id: str, request: Request, _=Depends(require_auth)):
+    """به‌روزرسانی یک قانون"""
+    if not RULES_ENGINE:
+        raise HTTPException(status_code=503, detail="Rules engine not initialized")
+    
+    body = await request.json()
+    success = await RULES_ENGINE.update_rule(rule_id, **body)
+    
+    if not success:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    
+    return {"ok": True}
+
+@app.delete("/api/rules/{rule_id}")
+async def delete_rule(rule_id: str, _=Depends(require_auth)):
+    """حذف یک قانون"""
+    if not RULES_ENGINE:
+        raise HTTPException(status_code=503, detail="Rules engine not initialized")
+    
+    success = await RULES_ENGINE.remove_rule(rule_id)
+    
+    if not success:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    
+    return {"ok": True}
+
+@app.post("/api/rules/external")
+async def add_external_list(request: Request, _=Depends(require_auth)):
+    """افزودن و دانلود یک لیست خارجی"""
+    if not RULES_ENGINE:
+        raise HTTPException(status_code=503, detail="Rules engine not initialized")
+    
+    body = await request.json()
+    list_name = body.get("list_name")
+    url = body.get("url")
+    
+    if not all([list_name, url]):
+        raise HTTPException(status_code=400, detail="Missing required fields: list_name, url")
+    
+    success = await RULES_ENGINE.download_external_list(list_name, url)
+    
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to download external list")
+    
+    return {"ok": True, "list_name": list_name}
+
+@app.post("/api/rules/refresh-external")
+async def refresh_external_lists(_=Depends(require_auth)):
+    """به‌روزرسانی تمام لیست‌های خارجی"""
+    if not RULES_ENGINE:
+        raise HTTPException(status_code=503, detail="Rules engine not initialized")
+    
+    await RULES_ENGINE.refresh_external_lists()
+    return {"ok": True}
+
+@app.post("/api/rules/evaluate/domain")
+async def evaluate_domain(request: Request, _=Depends(require_auth)):
+    """ارزیابی یک دامنه بر اساس قوانین"""
+    if not RULES_ENGINE:
+        raise HTTPException(status_code=503, detail="Rules engine not initialized")
+    
+    body = await request.json()
+    domain = body.get("domain")
+    
+    if not domain:
+        raise HTTPException(status_code=400, detail="Missing domain")
+    
+    action = await RULES_ENGINE.evaluate_domain(domain)
+    return {"domain": domain, "action": action}
+
+@app.post("/api/rules/evaluate/ip")
+async def evaluate_ip(request: Request, _=Depends(require_auth)):
+    """ارزیابی یک IP بر اساس قوانین"""
+    if not RULES_ENGINE:
+        raise HTTPException(status_code=503, detail="Rules engine not initialized")
+    
+    body = await request.json()
+    ip = body.get("ip")
+    
+    if not ip:
+        raise HTTPException(status_code=400, detail="Missing ip")
+    
+    action = await RULES_ENGINE.evaluate_ip(ip)
+    return {"ip": ip, "action": action}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], log_level="info", workers=1)
